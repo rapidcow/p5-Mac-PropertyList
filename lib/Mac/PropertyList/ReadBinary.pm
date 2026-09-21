@@ -5,6 +5,7 @@ use strict;
 use warnings;
 
 use Carp;
+use Config ();
 use Data::Dumper;
 use Encode            qw(decode);
 use Mac::PropertyList;
@@ -14,6 +15,10 @@ use POSIX             qw(SEEK_END SEEK_SET);
 our $VERSION = '1.603_02';
 
 my $Debug = $ENV{PLIST_DEBUG} || 0;
+
+use constant {
+    haveUnpack64 => ( eval { unpack('Q>', "\x10\x01\0\0\0\0\0\x0B") eq '1153202979583557643' } ? 1 : 0 ),
+};
 
 __PACKAGE__->_run( @ARGV ) unless caller;
 
@@ -153,13 +158,46 @@ sub _get_offset_table {
 
 	croak "reading offset table failed!" unless $read == $try_to_read;
 
-    my @offsets = unpack ["","C*","n*","(H6)*","N*"]->[$self->_trailer->{offset_size}], $raw_offset_table;
+    my @offsets = _unpack_int_array(
+	$self->_trailer->{offset_size},
+	$raw_offset_table);
 
 	$self->{offsets} = \@offsets;
+	}
 
-    if( $self->_trailer->{offset_size} == 3 ) {
-		@offsets = map { hex } @offsets;
-   	 	}
+{
+
+my %native_format = (
+	1 => "C*", 2 => "n*", 4 => "N*",
+	haveUnpack64 ? (8 => "Q>*") : ()
+	);
+
+# This function unpacks int for file offset and object ref index.
+# To err on the side of caution, limit this to integers represent-
+# able natively as IV/UV, even if lseek may accept larger offsets.
+
+sub _unpack_int_array {
+	my( $size, $buffer ) = @_;
+	$size > 0 or croak "integer of width <$size> is invalid";
+	if( exists $native_format{$size} ) {
+		unpack $native_format{$size}, $buffer;
+		}
+	# Deal with weird widths, like 3,5,6,7...
+	elsif( $size <= $Config::Config{ivsize} ) {
+		map { hex } unpack "(H@{[$size << 1]})*", $buffer;
+		}
+	else {
+		croak( "integer of width <$size> too wide" );
+		}
+	}
+
+}
+
+sub _read_object_refs {
+	my( $self, $length ) = @_;
+	my $buffer;
+	read $self->_fh, $buffer, $length * $self->_object_ref_size;
+	_unpack_int_array($self->_object_ref_size, $buffer);
 	}
 
 sub _read_object_at_offset {
@@ -319,13 +357,7 @@ my $type_readers = {
 	a => sub { # array
 		my( $self, $elements ) = @_;
 
-		my @objects = do {
-			my $buffer;
-			read $self->_fh, $buffer, $elements * $self->_object_ref_size;
-			unpack(
-				($self->_object_ref_size == 1 ? "C*" : "n*"), $buffer
-				);
-			};
+		my @objects = $self->_read_object_refs($elements);
 
 		my @array =
 			map { $self->_read_object_at_offset( $objects[$_] ) }
@@ -337,22 +369,8 @@ my $type_readers = {
 	d => sub { # dictionary
 		my( $self, $length ) = @_;
 
-		my @key_indices = do {
-			my $buffer;
-			my $s = $self->_object_ref_size;
-			read $self->_fh, $buffer, $length * $self->_object_ref_size;
-			unpack(
-				($self->_object_ref_size == 1 ? "C*" : "n*"), $buffer
-				);
-			};
-
-		my @objects = do {
-			my $buffer;
-			read $self->_fh, $buffer, $length * $self->_object_ref_size;
-			unpack(
-				($self->_object_ref_size == 1 ? "C*" : "n*"), $buffer
-				);
-			};
+		my @key_indices = $self->_read_object_refs($length);
+		my @objects = $self->_read_object_refs($length);
 
 		my %dict = map {
 			my $key   = $self->_read_object_at_offset($key_indices[$_])->value;
