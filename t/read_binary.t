@@ -9,6 +9,7 @@ BEGIN {
     binmode STDOUT, ':encoding(utf-8)';
 }
 
+use Config ();
 use Test::More;
 
 =encoding utf8
@@ -248,6 +249,72 @@ for my $index (0 .. $#want) {
     }
 }
 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Test with object refs of various width
+subtest 'various width object refs' => sub {
+	my $iz = $Config::Config{ivsize};
+	plan tests => 1 + (4 * $iz * $iz);
+
+	use_ok( $base_class, 'parse_plist' );
+	my $expect_key = 'key',
+	my @expect_array = ( 74, 97, 80, 72 );
+
+	foreach my $rz ( 1 .. $iz ) { foreach my $oz ( 1 .. $iz ) {
+SKIP:		{
+		my $test_data = various_width_fixture(
+			ob_ref_size => $rz,
+			offset_size => $oz,
+		);
+		my $plist = parse_plist( $test_data );
+
+		isa_ok( $plist, $dict_type ) or skip( "type mismatch", 3 );
+		ok( grep { $_ eq $expect_key } $plist->keys, "dict has $expect_key" );
+
+		my $array = $plist->value('key');
+		isa_ok( $array, $array_type ) or skip( "type mismatch", 3 );
+		is_deeply( [ map { $_->value } @{$array} ], \@expect_array );
+		}
+	} }
+};
+
 done_testing();
 
 sub bigint { return Math::BigInt->new( $_[0] ) };
+
+sub various_width_fixture {
+	my (%o) = @_;
+
+	my $rz = $o{ob_ref_size};
+	my $oz = $o{offset_size};
+
+	my $data = 'bplist00';
+	my $top_object = 0;
+	my @objects = (
+		# 0: Dictionary ( 1 => 2 )
+		"\xD1" . pack("(x@{[$rz - 1]} C)2", 1 => 2),
+
+		# 1: String "key"
+		"\x53key",
+
+		# 2: Array ( 3, 4, 5, 6 )
+		"\xA4" . pack("(x@{[$rz - 1]} C)4", 3 .. 6),
+
+		# 3: Integers
+		map { "\x10" . pack('C', $_) } (74, 97, 80, 72),
+		);
+
+	my @offsets;
+	foreach my $object (@objects) {
+		push @offsets, length($data);
+		$data .= $object;
+		}
+
+	my $table_start = length($data);
+	foreach my $offset (@offsets) {
+		$data .= pack("x@{[$oz - 1]} C", $offset);
+		}
+
+	$data .= pack("x6 C C (x4 N)3",
+		$oz, $rz, scalar(@objects), $top_object, $table_start);
+	return $data;
+	}
