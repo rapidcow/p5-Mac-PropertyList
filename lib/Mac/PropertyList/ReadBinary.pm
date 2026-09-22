@@ -140,8 +140,22 @@ sub _read_plist_trailer {
 	read $self->_fh, $buffer, 32;
 	my %hash;
 
-	@hash{ qw( offset_size ref_size object_count top_object table_offset ) }
-		= unpack "x6 C C (x4 N)3", $buffer;
+	@hash{ qw(
+		offset_size       ref_size
+		object_count_high object_count
+		top_object_high   top_object
+		table_offset_high table_offset
+	) }
+		= unpack "x6 C C ("
+		. ( haveUnpack64 ? "a0 Q>" : "NN" )
+		. ")3", $buffer;
+
+	if( my( $bad_key ) = grep { $hash{$_} && s/_high$// } keys %hash)
+		{
+		croak( "trailer $bad_key too large" );
+		}
+
+	delete @hash{ grep { /_high$/ } keys %hash };
 
 	$self->{trailer} = \%hash;
 	}
