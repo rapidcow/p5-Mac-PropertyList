@@ -96,15 +96,56 @@ sub _object_size {
 	$_[0]->_trailer->{object_count} * $_[0]->_trailer->{offset_size}
 	}
 
+# _read_fh and _seek_fh are autodie-wrappers of read() and seek().
+# _seek_fh also tell()s, though it shouldn't impose more restrictions
+# than the way we already expect the filehandle to be seekable.
+#
+# _curpos and _length track the current offset and the file size.
+# They are temporary states deleted upon parse completion.
+
+sub _read_fh {
+	my( $self, $try_to_read, $what ) = @_;
+	unless ($try_to_read <= $self->{_length} - $self->{_curpos}) {
+		croak( "reading $what extends beyond EOF" );
+		}
+
+	my $buffer;
+	my $really_read = read( $self->_fh, $buffer, $try_to_read );
+	croak( "reading $what failed! $!" ) unless defined $really_read;
+	unless ($really_read == $try_to_read) {
+		croak( "short read while reading $what "
+		. "(want $try_to_read, read $really_read)" );
+		}
+
+	$self->{_curpos} += $really_read;
+	$buffer;
+	}
+
+sub _seek_fh {
+	my( $self, $pos, $whence, $what ) = @_;
+	my $seek_ok = seek( $self->_fh, $pos, $whence );
+	croak( "seeking to $what failed! $!" ) unless $seek_ok;
+	$self->{_curpos} = $whence == SEEK_SET ? $pos : do {
+		my $cur = tell( $self->_fh );
+		croak( "telling from $what failed: $!" ) if $cur == -1;
+		$cur;
+		};
+	}
+
 sub _read {
 	my( $self, $thingy ) = @_;
 
 	$self->{fh} = $self->_get_filehandle;
+
+	$self->{_length} = $self->_seek_fh( 0, SEEK_END, "EOF" );
+
 	$self->_read_plist_trailer;
 
 	$self->_get_offset_table;
 
     my $top = $self->_read_object_at_offset( $self->_trailer->{top_object} );
+
+	delete @{$self}{qw( _curpos _length )};
 
     $self->{parsed} = $top;
 	}
@@ -134,10 +175,9 @@ sub _get_filehandle {
 sub _read_plist_trailer {
 	my $self = shift;
 
-	seek $self->_fh, -32, SEEK_END;
+	$self->_seek_fh( $self->{_length} - 32, SEEK_SET, "trailer" );
 
-	my $buffer;
-	read $self->_fh, $buffer, 32;
+	my $buffer = $self->_read_fh( 32, "trailer" );
 	my %hash;
 
 	@hash{ qw(
@@ -163,14 +203,11 @@ sub _read_plist_trailer {
 sub _get_offset_table {
 	my $self = shift;
 
-    seek $self->_fh, $self->_trailer->{table_offset}, SEEK_SET;
-
 	my $try_to_read = $self->_object_size;
 
-    my $raw_offset_table;
-    my $read = read $self->_fh, $raw_offset_table, $try_to_read;
+    $self->_seek_fh( $self->_trailer->{table_offset}, SEEK_SET, "offset table" );
 
-	croak "reading offset table failed!" unless $read == $try_to_read;
+    my $raw_offset_table = $self->_read_fh( $try_to_read, "offset table" );
 
     my @offsets = _unpack_int_array(
 	$self->_trailer->{offset_size},
@@ -209,15 +246,16 @@ sub _unpack_int_array {
 
 sub _read_object_refs {
 	my( $self, $length ) = @_;
-	my $buffer;
-	read $self->_fh, $buffer, $length * $self->_object_ref_size;
-	_unpack_int_array($self->_object_ref_size, $buffer);
+	my $try_to_read = $length * $self->_object_ref_size;
+
+	my $buffer = $self->_read_fh( $try_to_read, "object refs" );
+	_unpack_int_array( $self->_object_ref_size, $buffer );
 	}
 
 sub _read_object_at_offset {
 	my( $self, $offset ) = @_;
 
-    seek $self->_fh, ${ $self->_offsets }[$offset], SEEK_SET;
+    $self->_seek_fh( ${ $self->_offsets }[$offset], SEEK_SET );
 
     $self->_read_object;
 	}
@@ -253,8 +291,7 @@ my $type_readers = {
 
 		my $byte_length = 1 << $power_of_2;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, $byte_length;
+		my $buffer = $self->_read_fh( $byte_length, "integer" );
 
 		my @formats = qw( C n N NN NNNN );
 		my @values = unpack $formats[$power_of_2], $buffer;
@@ -296,8 +333,7 @@ my $type_readers = {
 
 		my $byte_length = 1 << $length;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, $byte_length;
+		my $buffer = $self->_read_fh( $byte_length, "real" );
 
 		my @formats = qw( a a f> d> );
 		my @values = unpack $formats[$length], $buffer;
@@ -310,8 +346,7 @@ my $type_readers = {
 		croak "Date != 8 bytes" if $length != 3;
 		my $byte_length = 1 << $length;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, $byte_length;
+		my $buffer = $self->_read_fh( $byte_length, "date" );
 
 		my @values = unpack 'd>', $buffer;
 
@@ -328,8 +363,7 @@ my $type_readers = {
 	4 => sub { # binary data
 		my( $self, $length ) = @_;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, $length;
+		my $buffer = $self->_read_fh( $length, "binary data" );
 
 		return Mac::PropertyList::data->new( $buffer );
 		},
@@ -337,8 +371,7 @@ my $type_readers = {
 	5 => sub { # utf8 string
 		my( $self, $length ) = @_;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, $length;
+		my $buffer = $self->_read_fh( $length, "utf8 string" );
 
 		$buffer = Encode::decode( 'ascii', $buffer );
 
@@ -348,8 +381,7 @@ my $type_readers = {
 	6 => sub { # unicode string
 		my( $self, $length ) = @_;
 
-		my( $buffer, $value );
-		read $self->_fh, $buffer, 2 * $length;
+		my $buffer = $self->_read_fh( 2 * $length, "unicode string" );
 
 		$buffer = Encode::decode( "UTF-16BE", $buffer );
 
@@ -361,7 +393,7 @@ my $type_readers = {
 
 		my $byte_length = $length + 1;
 
-		read $self->_fh, ( my $buffer ), $byte_length;
+		my $buffer = $self->_read_fh( $byte_length, "UID" );
 
 		my $value = unpack 'H*', $buffer;
 
@@ -398,10 +430,7 @@ my $type_readers = {
 
 sub _read_object {
 	my $self = shift;
-    my $buffer;
-
-    croak "read() failed while trying to get type byte! $!"
-    	unless read( $self->_fh, $buffer, 1) == 1;
+    my $buffer = $self->_read_fh( 1, "type byte" );
 
     my $length = unpack( "C*", $buffer ) & 0x0F;
     $buffer    = unpack "H*", $buffer;
